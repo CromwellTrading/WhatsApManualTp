@@ -1144,14 +1144,30 @@ async function startBot() {
       try {
         if (!msg.message || msg.key.fromMe) continue;
         const remoteJid = msg.key.remoteJid;
-        if (!remoteJid.endsWith('@s.whatsapp.net')) continue; // solo privado
-
         const participant = msg.key.participant || remoteJid;
-        const isAdmin = (participant === ADMIN_JID);
+        const pushName = msg.pushName || '';
         const text = extractText(msg);
-        if (!text) continue;
+        
+        // Log detallado
+        console.log(`\n📩 Mensaje recibido:`);
+        console.log(`   De: ${participant} (${pushName || 'sin nombre'})`);
+        console.log(`   Chat: ${remoteJid} (${remoteJid.endsWith('@s.whatsapp.net') ? 'privado' : 'grupo'})`);
+        console.log(`   Tipo: ${msg.message ? Object.keys(msg.message)[0] : 'desconocido'}`);
+        console.log(`   Texto: ${text || '(sin texto)'}`);
 
-        console.log(`Mensaje de ${participant}: ${text}`);
+        // Solo procesamos mensajes privados
+        if (!remoteJid.endsWith('@s.whatsapp.net')) {
+          console.log('   ⚠️ Ignorado: no es chat privado');
+          continue;
+        }
+
+        // Comando especial para obtener el propio JID
+        if (text && text.trim() === '/mid') {
+          await sendMessage(remoteJid, `Tu ID es: \`${participant}\``);
+          continue;
+        }
+
+        const isAdmin = (participant === ADMIN_JID);
 
         // Si es admin y hay un diálogo activo, procesarlo
         if (isAdmin) {
@@ -1160,7 +1176,7 @@ async function startBot() {
         }
 
         // Si es admin y comienza con /, comando
-        if (isAdmin && text.startsWith('/')) {
+        if (isAdmin && text && text.startsWith('/')) {
           await handleAdminCommand(msg, remoteJid, text);
           continue;
         }
