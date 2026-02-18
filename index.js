@@ -54,6 +54,19 @@ function generateRequestId() {
   return `${REQUEST_PREFIX}-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
 }
 
+// Detección de chat privado (no grupo, no broadcast)
+function isPrivateChat(jid) {
+  return !jid.endsWith('@g.us') && !jid.includes('@broadcast');
+}
+
+// Detección de palabra "oferta" con tolerancia a errores
+function containsOfertas(text) {
+  if (!text) return false;
+  const normalized = text.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, ""); // quitar tildes
+  // Variaciones comunes: oferta, ofertas, ofert, ofertaz, ofertax, etc.
+  return /oferta(s)?|oferts?/.test(normalized);
+}
+
 // ========== ACCESO A DATOS ==========
 async function getGames() {
   const { data, error } = await supabase.from('games').select('*').order('number', { ascending: true });
@@ -100,6 +113,13 @@ async function getOfferByGameAndNumber(gameId, number) {
   return data;
 }
 
+async function getOffersByIds(ids) {
+  if (!ids || ids.length === 0) return [];
+  const { data, error } = await supabase.from('offers').select('*').in('id', ids);
+  if (error) throw error;
+  return data;
+}
+
 async function getOfferById(id) {
   const { data, error } = await supabase.from('offers').select('*').eq('id', id).maybeSingle();
   if (error) throw error;
@@ -128,6 +148,7 @@ async function deleteOffer(offerId) {
   if (error) throw error;
 }
 
+// Métodos de pago
 async function getPaymentMethods(type) {
   const query = supabase.from('payment_methods').select('*').order('number', { ascending: true });
   if (type) query.eq('type', type);
@@ -163,6 +184,29 @@ async function deletePaymentMethod(id) {
   if (error) throw error;
 }
 
+// Campos por juego
+async function getGameFields(gameId) {
+  const { data, error } = await supabase.from('game_fields').select('*').eq('game_id', gameId).order('field_order', { ascending: true });
+  if (error) throw error;
+  return data || [];
+}
+
+async function createGameField(gameId, fieldName, fieldOrder, required = true) {
+  const { error } = await supabase.from('game_fields').insert({
+    game_id: gameId,
+    field_name: fieldName,
+    field_order: fieldOrder,
+    required
+  });
+  if (error) throw error;
+}
+
+async function deleteGameField(gameId, fieldName) {
+  const { error } = await supabase.from('game_fields').delete().eq('game_id', gameId).eq('field_name', fieldName);
+  if (error) throw error;
+}
+
+// Sesiones de usuario
 async function getUserSession(userJid) {
   const { data, error } = await supabase.from('user_sessions').select('*').eq('user_jid', userJid).maybeSingle();
   if (error) throw error;
@@ -186,6 +230,7 @@ async function updateUserSession(userJid, updates) {
   if (error) throw error;
 }
 
+// Solicitudes
 async function createRequest(requestId, data) {
   const { error } = await supabase.from('requests').insert({ id: requestId, ...data });
   if (error) throw error;
@@ -205,6 +250,7 @@ async function completeRequest(requestId) {
   if (error) throw error;
 }
 
+// Diálogos de admin
 async function getAdminDialog(adminJid) {
   const { data, error } = await supabase.from('admin_dialogs').select('*').eq('admin_jid', adminJid).maybeSingle();
   if (error) throw error;
@@ -292,8 +338,15 @@ async function handleClientMessage(msg, jid, text) {
   const session = await getUserSession(jid);
   const lower = text.trim().toLowerCase();
 
+  // Detectar palabra "oferta" para reiniciar
+  if (containsOfertas(text) && session.step !== 'idle') {
+    await sendMainMenu(jid);
+    await updateUserSession(jid, { step: 'idle', selected_game: null, selected_offers: null, field_values: null, current_field: null, request_id: null });
+    return;
+  }
+
   if (lower === 'cancelar') {
-    await updateUserSession(jid, { step: 'idle', selected_game: null, selected_offer_id: null, selected_payment_type: null, selected_payment_number: null, request_id: null });
+    await updateUserSession(jid, { step: 'idle', selected_game: null, selected_offers: null, field_values: null, current_field: null, request_id: null });
     await sendMainMenu(jid);
     return;
   }
@@ -330,16 +383,17 @@ async function handleClientMessage(msg, jid, text) {
         if (o.price_usd) offerText += ` / 💵 ${o.price_usd} USD`;
         offerText += '\n';
       });
-      offerText += '\nResponde con el *número* de la oferta que deseas.';
+      offerText += '\nResponde con los *números* de las ofertas que deseas (separados por coma o espacio). Ej: 1,2 o 1 2';
       await sendWithCancelHint(jid, offerText);
-      await updateUserSession(jid, { step: 'awaiting_offer', selected_game: gameNumber });
+      await updateUserSession(jid, { step: 'awaiting_offers', selected_game: gameNumber });
       break;
     }
 
-    case 'awaiting_offer': {
-      const offerNumber = emojiToNumber(text);
-      if (!offerNumber) {
-        await sendWithCancelHint(jid, '❌ Número no válido. Responde con el número de la oferta.');
+    case 'awaiting_offers': {
+      // Parsear múltiples números
+      const numbers = text.split(/[,\s]+/).map(s => emojiToNumber(s)).filter(n => n !== null);
+      if (numbers.length === 0) {
+        await sendWithCancelHint(jid, '❌ No se reconocieron números. Intenta de nuevo.');
         return;
       }
       const game = await getGameByNumber(session.selected_game);
@@ -348,143 +402,60 @@ async function handleClientMessage(msg, jid, text) {
         await updateUserSession(jid, { step: 'idle' });
         return;
       }
-      const offer = await getOfferByGameAndNumber(game.id, offerNumber);
-      if (!offer) {
-        await sendWithCancelHint(jid, '❌ Oferta no encontrada. Elige un número de la lista.');
-        return;
-      }
-      await updateUserSession(jid, { step: 'awaiting_payment_method', selected_offer_id: offer.id });
-      const cards = await getPaymentMethods('card');
-      const mobiles = await getPaymentMethods('mobile');
-      let msg = 'Elige el método de pago:\n';
-      if (cards.length > 0) msg += '1️⃣ Tarjeta\n';
-      if (mobiles.length > 0) msg += '2️⃣ Saldo móvil\n';
-      if (cards.length === 0 && mobiles.length === 0) {
-        msg = '❌ No hay métodos de pago configurados. Contacta al admin.';
-        await sendMessage(jid, msg);
-        await updateUserSession(jid, { step: 'idle' });
-        return;
-      }
-      msg += '\nResponde 1 o 2.';
-      await sendWithCancelHint(jid, msg);
-      break;
-    }
-
-    case 'awaiting_payment_method': {
-      const method = text.trim();
-      if (method !== '1' && method !== '2') {
-        await sendWithCancelHint(jid, '❌ Responde 1 para tarjeta o 2 para saldo móvil.');
-        return;
-      }
-      const type = method === '1' ? 'card' : 'mobile';
-      const methods = await getPaymentMethods(type);
-      if (methods.length === 0) {
-        await sendWithCancelHint(jid, '❌ No hay métodos de ese tipo configurados. Intenta con otro.');
-        return;
-      }
-      let list = `Métodos de pago (${type === 'card' ? 'Tarjetas' : 'Saldo móvil'}):\n`;
-      methods.forEach(m => {
-        list += `${numberToEmoji(m.number)} ${m.label}\n`;
-      });
-      list += '\nResponde con el número del método que usarás.';
-      await sendWithCancelHint(jid, list);
-      await updateUserSession(jid, { step: 'awaiting_payment_choice', selected_payment_type: type });
-      break;
-    }
-
-    case 'awaiting_payment_choice': {
-      const choiceNumber = emojiToNumber(text);
-      if (!choiceNumber) {
-        await sendWithCancelHint(jid, '❌ Número no válido. Elige un número de la lista.');
-        return;
-      }
-      const method = await getPaymentMethodByNumber(session.selected_payment_type, choiceNumber);
-      if (!method) {
-        await sendWithCancelHint(jid, '❌ Método no encontrado. Intenta de nuevo.');
-        return;
-      }
-      const game = await getGameByNumber(session.selected_game);
-      const offer = await getOfferById(session.selected_offer_id);
-      if (!game || !offer) {
-        await sendWithCancelHint(jid, '❌ Error interno. Vuelve a empezar.');
-        await updateUserSession(jid, { step: 'idle' });
-        return;
-      }
-
-      const requestId = generateRequestId();
-      const paymentDetails = method.details;
-
-      let paymentInfo = `🧾 *Solicitud #${requestId}*\n\n`;
-      paymentInfo += `🎮 Juego: ${game.name}\n`;
-      paymentInfo += `💰 Oferta: ${offer.description}\n`;
-      if (method.type === 'card') {
-        paymentInfo += `💳 Tarjeta: ${paymentDetails.card_number}\n`;
-        paymentInfo += `🔢 Número a confirmar: ${paymentDetails.confirm_number}\n`;
-      } else {
-        paymentInfo += `📲 Saldo móvil: ${paymentDetails.phone_number}\n`;
-      }
-      paymentInfo += `\n*Por favor, envía la captura de pantalla del pago realizado.*`;
-
-      await sendMessage(jid, paymentInfo);
-      await updateUserSession(jid, {
-        step: 'awaiting_screenshot',
-        request_id: requestId,
-        selected_payment_number: choiceNumber
-      });
-      break;
-    }
-
-    case 'awaiting_screenshot': {
-      if (!msg.message?.imageMessage && !msg.message?.documentMessage) {
-        await sendWithCancelHint(jid, '❌ Debes enviar una *imagen* (captura de pantalla). Si ya pagaste, envía la foto.');
-        return;
-      }
-
-      try {
-        const stream = await sock.downloadMediaMessage(msg);
-        const buffer = [];
-        for await (const chunk of stream) {
-          buffer.push(chunk);
+      // Verificar que todos los números correspondan a ofertas existentes
+      const offers = await getOffersByGameId(game.id);
+      const selectedOffers = [];
+      for (const num of numbers) {
+        const offer = offers.find(o => o.number === num);
+        if (!offer) {
+          await sendWithCancelHint(jid, `❌ La oferta número ${num} no existe. Revisa la lista.`);
+          return;
         }
-        const fileBuffer = Buffer.concat(buffer);
-        const fileName = `screenshots/${session.request_id}.png`;
-        const { error: uploadError } = await supabase.storage
-          .from('recargas')
-          .upload(fileName, fileBuffer, { contentType: 'image/png', upsert: true });
-        if (uploadError) throw uploadError;
+        selectedOffers.push(offer.id);
+      }
+      // Guardar ofertas seleccionadas
+      await updateUserSession(jid, { step: 'awaiting_fields', selected_offers: selectedOffers, field_values: {}, current_field: 0 });
 
-        const { data: urlData } = supabase.storage.from('recargas').getPublicUrl(fileName);
-        const screenshotUrl = urlData.publicUrl;
+      // Obtener campos del juego
+      const fields = await getGameFields(game.id);
+      if (fields.length === 0) {
+        // Si no hay campos, pasar directamente a notificación al admin
+        await sendRequestToAdmin(jid, session, selectedOffers, {});
+      } else {
+        // Preguntar primer campo
+        const field = fields[0];
+        await sendMessage(jid, `✏️ Por favor, envía tu *${field.field_name}*:`);
+      }
+      break;
+    }
 
-        const game = await getGameByNumber(session.selected_game);
-        const offer = await getOfferById(session.selected_offer_id);
-        const method = await getPaymentMethodByNumber(session.selected_payment_type, session.selected_payment_number);
-
-        await createRequest(session.request_id, {
-          user_jid: jid,
-          game_name: game.name,
-          offer_desc: offer.description,
-          payment_method: method.label,
-          payment_details: method.details,
-          screenshot_url: screenshotUrl,
-          status: 'pending'
-        });
-
-        let adminMsg = `🔔 *NUEVA SOLICITUD* 🔔\n\n`;
-        adminMsg += `ID: ${session.request_id}\n`;
-        adminMsg += `Usuario: ${jid.split('@')[0]}\n`;
-        adminMsg += `Juego: ${game.name}\n`;
-        adminMsg += `Oferta: ${offer.description}\n`;
-        adminMsg += `Método: ${method.label}\n`;
-        adminMsg += `Captura: ${screenshotUrl}\n\n`;
-        adminMsg += `_Para completar, escribe:_\n/completar ${session.request_id}`;
-        await sendMessage(ADMIN_JID, adminMsg);
-
-        await sendMessage(jid, `✅ Solicitud #${session.request_id} enviada. Espera la confirmación del admin.`);
-        await updateUserSession(jid, { step: 'idle', selected_game: null, selected_offer_id: null, selected_payment_type: null, selected_payment_number: null, request_id: null });
-      } catch (err) {
-        console.error('Error al procesar captura:', err);
-        await sendWithCancelHint(jid, '❌ Ocurrió un error al recibir la captura. Intenta de nuevo o contacta al admin.');
+    case 'awaiting_fields': {
+      const game = await getGameByNumber(session.selected_game);
+      if (!game) {
+        await sendWithCancelHint(jid, '❌ Error: juego no encontrado. Vuelve a empezar.');
+        await updateUserSession(jid, { step: 'idle' });
+        return;
+      }
+      const fields = await getGameFields(game.id);
+      const currentIdx = session.current_field || 0;
+      if (currentIdx >= fields.length) {
+        // Ya se preguntaron todos, debería haber terminado
+        await sendRequestToAdmin(jid, session, session.selected_offers, session.field_values);
+        return;
+      }
+      // Guardar el valor del campo actual
+      const field = fields[currentIdx];
+      const fieldValues = session.field_values || {};
+      fieldValues[field.field_name] = text;
+      // Pasar al siguiente campo
+      if (currentIdx + 1 < fields.length) {
+        const nextField = fields[currentIdx + 1];
+        await updateUserSession(jid, { field_values: fieldValues, current_field: currentIdx + 1 });
+        await sendMessage(jid, `✏️ Ahora, envía tu *${nextField.field_name}*:`);
+      } else {
+        // Terminó, enviar notificación al admin
+        await updateUserSession(jid, { field_values: fieldValues });
+        await sendRequestToAdmin(jid, session, session.selected_offers, fieldValues);
       }
       break;
     }
@@ -494,17 +465,57 @@ async function handleClientMessage(msg, jid, text) {
   }
 }
 
+async function sendRequestToAdmin(jid, session, offerIds, fieldValues) {
+  const game = await getGameByNumber(session.selected_game);
+  const offers = await getOffersByIds(offerIds);
+  const userNumber = jid.split('@')[0]; // parte numérica
+
+  // Crear solicitud en BD (pendiente)
+  const requestId = generateRequestId();
+  await createRequest(requestId, {
+    user_jid: jid,
+    game_name: game.name,
+    offer_desc: offers.map(o => o.description).join(', '),
+    payment_method: 'pendiente',
+    payment_details: { field_values: fieldValues },
+    screenshot_url: null,
+    status: 'pending'
+  });
+
+  // Notificar al admin
+  let adminMsg = `🔔 *NUEVA SOLICITUD* 🔔\n\n`;
+  adminMsg += `👤 Usuario: +${userNumber}\n`; // formato internacional
+  adminMsg += `🎮 Juego: ${game.name}\n`;
+  adminMsg += `💰 Ofertas:\n`;
+  offers.forEach(o => {
+    adminMsg += `   - ${o.description} (💳 ${o.price_card} / 📲 ${o.price_mobile})\n`;
+  });
+  if (Object.keys(fieldValues).length > 0) {
+    adminMsg += `📋 Datos proporcionados:\n`;
+    for (const [key, val] of Object.entries(fieldValues)) {
+      adminMsg += `   ${key}: ${val}\n`;
+    }
+  }
+  adminMsg += `\n_El admin debe enviar los datos de pago al usuario y luego ejecutar:_\n/completar ${requestId}`;
+
+  await sendMessage(ADMIN_JID, adminMsg);
+  await sendMessage(jid, `✅ Solicitud #${requestId} enviada. Un administrador te contactará en breve con los datos de pago.`);
+  // Limpiar sesión
+  await updateUserSession(jid, { step: 'idle', selected_game: null, selected_offers: null, field_values: null, current_field: null, request_id: null });
+}
+
 async function handleBack(jid, session) {
   switch (session.step) {
     case 'awaiting_game':
     case 'idle':
       await sendMainMenu(jid);
       break;
-    case 'awaiting_offer':
+    case 'awaiting_offers':
       await sendMainMenu(jid);
       await updateUserSession(jid, { step: 'idle', selected_game: null });
       break;
-    case 'awaiting_payment_method':
+    case 'awaiting_fields':
+      // Volver a la selección de ofertas
       {
         const game = await getGameByNumber(session.selected_game);
         if (!game) {
@@ -516,25 +527,10 @@ async function handleBack(jid, session) {
         offers.forEach(o => {
           offerText += `${numberToEmoji(o.number)} ${o.description} — 💳 ${o.price_card} CUP / 📲 ${o.price_mobile} CUP\n`;
         });
-        offerText += '\nElige el número de la oferta:';
+        offerText += '\nResponde con los números de las ofertas que deseas (separados por coma o espacio).';
         await sendWithCancelHint(jid, offerText);
-        await updateUserSession(jid, { step: 'awaiting_offer', selected_offer_id: null });
+        await updateUserSession(jid, { step: 'awaiting_offers', selected_offers: null, field_values: null, current_field: null });
       }
-      break;
-    case 'awaiting_payment_choice':
-      {
-        const cards = await getPaymentMethods('card');
-        const mobiles = await getPaymentMethods('mobile');
-        let msg = 'Elige el método de pago:\n';
-        if (cards.length > 0) msg += '1️⃣ Tarjeta\n';
-        if (mobiles.length > 0) msg += '2️⃣ Saldo móvil\n';
-        msg += '\nResponde 1 o 2.';
-        await sendWithCancelHint(jid, msg);
-        await updateUserSession(jid, { step: 'awaiting_payment_method', selected_payment_type: null, selected_payment_number: null });
-      }
-      break;
-    case 'awaiting_screenshot':
-      await sendWithCancelHint(jid, 'Para cambiar el método de pago, escribe "cancelar" y vuelve a empezar.');
       break;
     default:
       await sendMainMenu(jid);
@@ -590,6 +586,61 @@ async function handleAdminCommand(msg, jid, text) {
     }
     await setAdminDialog(jid, 'anadir_ofertas', 1, { game_id: game.id, game_number: gameNumber, offers: [] });
     await sendMessage(jid, `✏️ Agregando ofertas para *${game.name}*. Envía cada oferta en el formato:\n1️⃣ 110 💎 250 700\n(número, descripción, precio móvil, precio tarjeta, precio USD opcional)\nCuando termines, escribe /fin`);
+    return;
+  }
+
+  // Comandos de campos
+  if (command === '/campos' && parts[1] === 'agregar' && parts[2] && parts[3]) {
+    const gameNumber = emojiToNumber(parts[2]);
+    const fieldName = parts.slice(3).join(' ');
+    const game = await getGameByNumber(gameNumber);
+    if (!game) {
+      await sendMessage(jid, '❌ Juego no encontrado.');
+      return;
+    }
+    const fields = await getGameFields(game.id);
+    const nextOrder = fields.length + 1;
+    try {
+      await createGameField(game.id, fieldName, nextOrder);
+      await sendMessage(jid, `✅ Campo "${fieldName}" agregado al juego ${game.name}.`);
+    } catch (err) {
+      await sendMessage(jid, `❌ Error: ${err.message}`);
+    }
+    return;
+  }
+  if (command === '/campos' && parts[1] === 'quitar' && parts[2] && parts[3]) {
+    const gameNumber = emojiToNumber(parts[2]);
+    const fieldName = parts.slice(3).join(' ');
+    const game = await getGameByNumber(gameNumber);
+    if (!game) {
+      await sendMessage(jid, '❌ Juego no encontrado.');
+      return;
+    }
+    try {
+      await deleteGameField(game.id, fieldName);
+      await sendMessage(jid, `✅ Campo "${fieldName}" eliminado del juego ${game.name}.`);
+    } catch (err) {
+      await sendMessage(jid, `❌ Error: ${err.message}`);
+    }
+    return;
+  }
+  if (command === '/campos' && parts[1] === 'listar' && parts[2]) {
+    const gameNumber = emojiToNumber(parts[2]);
+    const game = await getGameByNumber(gameNumber);
+    if (!game) {
+      await sendMessage(jid, '❌ Juego no encontrado.');
+      return;
+    }
+    const fields = await getGameFields(game.id);
+    if (fields.length === 0) {
+      await sendMessage(jid, `El juego ${game.name} no tiene campos configurados.`);
+      return;
+    }
+    let reply = `*Campos para ${game.name}:*\n`;
+    fields.forEach(f => {
+      reply += `- ${f.field_name} (${f.required ? 'obligatorio' : 'opcional'})\n`;
+    });
+    await sendMessage(jid, reply);
     return;
   }
 
@@ -752,7 +803,7 @@ async function handleAdminCommand(msg, jid, text) {
     return;
   }
 
-  await sendMessage(jid, '❌ Comando no reconocido. Usa /crear tarjeta, /crear saldo, /crear tabla, /añadir juego a #, /editar juego #, /editar oferta # #, /editar tarjeta #, /editar saldo #, /listar juegos, /listar ofertas #, /listar metodos, /borrar juego #, /borrar oferta # #, /borrar tarjeta #, /borrar saldo #, /completar ID');
+  await sendMessage(jid, '❌ Comando no reconocido. Usa /crear tarjeta, /crear saldo, /crear tabla, /añadir juego a #, /campos agregar # nombre, /campos quitar # nombre, /campos listar #, /editar juego #, /editar oferta # #, /editar tarjeta #, /editar saldo #, /listar juegos, /listar ofertas #, /listar metodos, /borrar juego #, /borrar oferta # #, /borrar tarjeta #, /borrar saldo #, /completar ID');
 }
 
 // ========== MANEJO DE DIÁLOGOS DEL ADMIN ==========
@@ -1147,16 +1198,17 @@ async function startBot() {
         const participant = msg.key.participant || remoteJid;
         const pushName = msg.pushName || '';
         const text = extractText(msg);
-        
-        // Log detallado
+
+        // Determinar tipo de chat
+        const chatType = isPrivateChat(remoteJid) ? 'privado' : 'grupo';
         console.log(`\n📩 Mensaje recibido:`);
         console.log(`   De: ${participant} (${pushName || 'sin nombre'})`);
-        console.log(`   Chat: ${remoteJid} (${remoteJid.endsWith('@s.whatsapp.net') ? 'privado' : 'grupo'})`);
+        console.log(`   Chat: ${remoteJid} (${chatType})`);
         console.log(`   Tipo: ${msg.message ? Object.keys(msg.message)[0] : 'desconocido'}`);
         console.log(`   Texto: ${text || '(sin texto)'}`);
 
         // Solo procesamos mensajes privados
-        if (!remoteJid.endsWith('@s.whatsapp.net')) {
+        if (!isPrivateChat(remoteJid)) {
           console.log('   ⚠️ Ignorado: no es chat privado');
           continue;
         }
